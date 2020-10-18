@@ -1,8 +1,7 @@
 //! Execution module for the test runner.
 
 use super::{
-    Harness, Outcome, Phase, SuiteResult, Test, TestFlags, TestOutcomeResult, TestResult,
-    TestSuite, CLI,
+    Harness, Outcome, Phase, SuiteResult, Test, TestFlags, TestOutcomeResult, TestResult, TestSuite,
 };
 use boa::{parse, Context};
 use colored::Colorize;
@@ -27,29 +26,40 @@ static IGNORED: Lazy<FxHashSet<Box<str>>> = Lazy::new(|| {
 
 impl TestSuite {
     /// Runs the test suite.
-    pub(crate) fn run(&self, harness: &Harness) -> SuiteResult {
-        if CLI.verbose() {
+    pub(crate) fn run(&self, harness: &Harness, verbose: u8) -> SuiteResult {
+        if verbose != 0 {
             println!("Suite {}:", self.name);
         }
 
         // TODO: in parallel
-        let suites: Vec<_> = self.suites.iter().map(|suite| suite.run(harness)).collect();
+        let suites: Vec<_> = self
+            .suites
+            .iter()
+            .map(|suite| suite.run(harness, verbose))
+            .collect();
 
         // TODO: in parallel
-        let tests: Vec<_> = self.tests.iter().map(|test| test.run(harness)).collect();
+        let tests: Vec<_> = self
+            .tests
+            .iter()
+            .map(|test| test.run(harness, verbose))
+            .flatten()
+            .collect();
 
-        if CLI.verbose() {
+        if verbose != 0 {
             println!();
         }
 
         // Count passed tests
         let mut passed = 0;
         let mut ignored = 0;
+        let mut panic = 0;
         for test in &tests {
             match test.result {
                 TestOutcomeResult::Passed => passed += 1,
                 TestOutcomeResult::Ignored => ignored += 1,
-                _ => {}
+                TestOutcomeResult::Panic => panic += 1,
+                TestOutcomeResult::Failed => {}
             }
         }
 
@@ -59,14 +69,16 @@ impl TestSuite {
             total += suite.total;
             passed += suite.passed;
             ignored += suite.ignored;
+            panic += suite.panic;
         }
 
-        if CLI.verbose() {
+        if verbose != 0 {
             println!(
-                "Results: total: {}, passed: {}, ignored: {}, conformance: {:.2}%",
+                "Results: total: {}, passed: {}, ignored: {}, panics: {}, conformance: {:.2}%",
                 total,
-                passed,
-                ignored,
+                passed.to_string().green(),
+                ignored.to_string().yellow(),
+                panic.to_string().red(),
                 (passed as f64 / total as f64) * 100.0
             );
         }
@@ -76,6 +88,7 @@ impl TestSuite {
             total,
             passed,
             ignored,
+            panic,
             suites,
             tests,
         }
@@ -84,79 +97,87 @@ impl TestSuite {
 
 impl Test {
     /// Runs the test.
-    pub(crate) fn run(&self, harness: &Harness) -> TestResult {
-        // println!("Starting `{}`", self.name);
+    pub(crate) fn run(&self, harness: &Harness, verbose: u8) -> Vec<TestResult> {
+        let mut results = Vec::new();
+        if self.flags.contains(TestFlags::STRICT) {
+            results.push(self.run_once(harness, true, verbose));
+        }
 
-        let result = if !self.flags.intersects(TestFlags::ASYNC | TestFlags::MODULE)
+        if self.flags.contains(TestFlags::NO_STRICT) || self.flags.contains(TestFlags::RAW) {
+            results.push(self.run_once(harness, false, verbose));
+        }
+
+        results
+    }
+
+    /// Runs the test once, in strict or non-strict mode
+    fn run_once(&self, harness: &Harness, strict: bool, verbose: u8) -> TestResult {
+        if verbose > 1 {
+            println!(
+                "Starting `{}`{}",
+                self.name,
+                if strict { " (strict mode)" } else { "" }
+            );
+        }
+
+        let (result, result_text) = if !self.flags.intersects(TestFlags::ASYNC | TestFlags::MODULE)
             && !IGNORED.contains(&self.name)
-        {
-            let res = panic::catch_unwind(|| {
-                match self.expected_outcome {
-                    Outcome::Positive => {
-                        let mut passed = true;
+            && (matches!(self.expected_outcome, Outcome::Positive)
+                || matches!(self.expected_outcome, Outcome::Negative {
+                    phase: Phase::Parse,
+                    error_type: _,
+                })) {
+            let res = panic::catch_unwind(|| match self.expected_outcome {
+                Outcome::Positive => {
+                    let mut engine = self.set_up_env(&harness, strict);
+                    let res = engine.eval(&self.content);
 
-                        if self.flags.contains(TestFlags::RAW) {
-                            let mut engine = self.set_up_env(&harness, false);
-                            let res = engine.eval(&self.content);
+                    let passed = res.is_ok();
+                    let text = match res {
+                        Ok(val) => format!("{}", val.display()),
+                        Err(e) => format!("Uncaught {}", e.display()),
+                    };
 
-                            passed = res.is_ok()
-                        } else {
-                            if self.flags.contains(TestFlags::STRICT) {
-                                let mut engine = self.set_up_env(&harness, true);
-                                let res = engine.eval(&self.content);
+                    (passed, text)
+                }
+                Outcome::Negative {
+                    phase: Phase::Parse,
+                    ref error_type,
+                } => {
+                    assert_eq!(
+                        error_type.as_ref(),
+                        "SyntaxError",
+                        "non-SyntaxError parsing error found in {}",
+                        self.name
+                    );
 
-                                passed = res.is_ok()
-                            }
-
-                            if passed && self.flags.contains(TestFlags::NO_STRICT) {
-                                let mut engine = self.set_up_env(&harness, false);
-                                let res = engine.eval(&self.content);
-
-                                passed = res.is_ok()
-                            }
-                        }
-
-                        passed
-                    }
-                    Outcome::Negative {
-                        phase: Phase::Parse,
-                        ref error_type,
-                    } => {
-                        assert_eq!(
-                            error_type.as_ref(),
-                            "SyntaxError",
-                            "non-SyntaxError parsing error found in {}",
-                            self.name
-                        );
-
-                        parse(&self.content).is_err()
-                    }
-                    Outcome::Negative {
-                        phase: _,
-                        error_type: _,
-                    } => {
-                        // TODO: check the phase
-                        false
+                    match parse(&self.content, strict) {
+                        Ok(n) => (false, format!("{:?}", n)),
+                        Err(e) => (true, format!("Uncaught {}", e)),
                     }
                 }
+                Outcome::Negative {
+                    phase: _,
+                    error_type: _,
+                } => todo!("check the phase"),
             });
 
             let result = res
-                .map(|res| {
+                .map(|(res, text)| {
                     if res {
-                        TestOutcomeResult::Passed
+                        (TestOutcomeResult::Passed, text)
                     } else {
-                        TestOutcomeResult::Failed
+                        (TestOutcomeResult::Failed, text)
                     }
                 })
                 .unwrap_or_else(|_| {
                     eprintln!("last panic was on test \"{}\"", self.name);
-                    TestOutcomeResult::Panic
+                    (TestOutcomeResult::Panic, String::new())
                 });
 
             print!(
                 "{}",
-                if let TestOutcomeResult::Passed = result {
+                if let (TestOutcomeResult::Passed, _) = result {
                     ".".green()
                 } else {
                     ".".red()
@@ -168,12 +189,14 @@ impl Test {
             // Ignoring async tests for now.
             // TODO: implement async and add `harness/doneprintHandle.js` to the includes.
             print!("{}", ".".yellow());
-            TestOutcomeResult::Ignored
+            (TestOutcomeResult::Ignored, String::new())
         };
 
         TestResult {
             name: self.name.clone(),
+            strict,
             result,
+            result_text: result_text.into_boxed_str(),
         }
     }
 

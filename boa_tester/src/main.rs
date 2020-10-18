@@ -42,11 +42,10 @@ mod results;
 
 use self::{
     read::{read_harness, read_suite, read_test, MetaData, Negative, TestFlag},
-    results::write_json,
+    results::{compare_results, write_json},
 };
 use bitflags::bitflags;
 use fxhash::FxHashMap;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -54,55 +53,70 @@ use std::{
 };
 use structopt::StructOpt;
 
-/// CLI information.
-static CLI: Lazy<Cli> = Lazy::new(Cli::from_args);
-
 /// Boa test262 tester
 #[derive(StructOpt, Debug)]
 #[structopt(name = "Boa test262 tester")]
-struct Cli {
-    // Whether to show verbose output.
-    #[structopt(short, long)]
-    verbose: bool,
+enum Cli {
+    /// Run the test suitr.
+    Run {
+        /// Whether to show verbose output.
+        #[structopt(short, long, parse(from_occurrences))]
+        verbose: u8,
 
-    /// Path to the Test262 suite.
-    #[structopt(long, parse(from_os_str), default_value = "./test262")]
-    test262_path: PathBuf,
+        /// Path to the Test262 suite.
+        #[structopt(long, parse(from_os_str), default_value = "./test262")]
+        test262_path: PathBuf,
 
-    /// Which specific test or test suite to run.
-    #[structopt(short, long, parse(from_os_str), default_value = "test")]
-    suite: PathBuf,
+        /// Which specific test or test suite to run.
+        #[structopt(short, long, parse(from_os_str), default_value = "test")]
+        suite: PathBuf,
 
-    /// Optional output folder for the full results information.
-    #[structopt(short, long, parse(from_os_str))]
-    output: Option<PathBuf>,
-}
+        /// Optional output folder for the full results information.
+        #[structopt(short, long, parse(from_os_str))]
+        output: Option<PathBuf>,
+    },
+    Compare {
+        /// Base results of the suite.
+        #[structopt(parse(from_os_str))]
+        base: PathBuf,
 
-impl Cli {
-    // Whether to show verbose output.
-    fn verbose(&self) -> bool {
-        self.verbose
-    }
+        /// New results to compare.
+        #[structopt(parse(from_os_str))]
+        new: PathBuf,
 
-    /// Path to the Test262 suite.
-    fn test262_path(&self) -> &Path {
-        self.test262_path.as_path()
-    }
-
-    /// Which specific test or test suite to run.
-    fn suite(&self) -> &Path {
-        self.suite.as_path()
-    }
-
-    /// Optional output folder for the full results information.
-    fn output(&self) -> Option<&Path> {
-        self.output.as_deref()
-    }
+        /// Whether to use markdown output
+        #[structopt(short, long)]
+        markdown: bool,
+    },
 }
 
 /// Program entry point.
 fn main() {
-    if let Some(path) = CLI.output() {
+    match Cli::from_args() {
+        Cli::Run {
+            verbose,
+            test262_path,
+            suite,
+            output,
+        } => {
+            run_test_suite(
+                verbose,
+                test262_path.as_path(),
+                suite.as_path(),
+                output.as_deref(),
+            );
+        }
+        Cli::Compare {
+            base,
+            new,
+            markdown,
+        } => compare_results(base.as_path(), new.as_path(), markdown),
+    }
+}
+
+/// Runst the full test suite.
+fn run_test_suite(verbose: u8, test262_path: &Path, suite: &Path, output: Option<&Path>) {
+    if let Some(path) = output {
         if path.exists() {
             if !path.is_dir() {
                 eprintln!("The output path must be a directory.");
@@ -113,29 +127,28 @@ fn main() {
         }
     }
 
-    if CLI.verbose() {
+    if verbose != 0 {
         println!("Loading the test suite...");
     }
-    let harness = read_harness().expect("could not read initialization bindings");
+    let harness = read_harness(test262_path).expect("could not read initialization bindings");
 
-    if CLI.suite().to_string_lossy().ends_with(".js") {
-        let test = read_test(&CLI.test262_path().join(CLI.suite()))
-            .expect("could not get the test to run");
+    if suite.to_string_lossy().ends_with(".js") {
+        let test = read_test(&test262_path.join(suite)).expect("could not get the test to run");
 
-        if CLI.verbose() {
+        if verbose != 0 {
             println!("Test loaded, starting...");
         }
-        test.run(&harness);
+        test.run(&harness, verbose);
 
         println!();
     } else {
-        let suite = read_suite(&CLI.test262_path().join(CLI.suite()))
-            .expect("could not get the list of tests to run");
+        let suite =
+            read_suite(&test262_path.join(suite)).expect("could not get the list of tests to run");
 
-        if CLI.verbose() {
+        if verbose != 0 {
             println!("Test suite loaded, starting tests...");
         }
-        let results = suite.run(&harness);
+        let results = suite.run(&harness, verbose);
 
         println!();
         println!("Results:");
@@ -146,7 +159,8 @@ fn main() {
             (results.passed as f64 / results.total as f64) * 100.0
         );
 
-        write_json(results).expect("could not write the results to the output JSON file");
+        write_json(results, output, verbose)
+            .expect("could not write the results to the output JSON file");
     }
 }
 
@@ -173,10 +187,12 @@ struct SuiteResult {
     name: Box<str>,
     #[serde(rename = "c")]
     total: usize,
-    #[serde(rename = "p")]
+    #[serde(rename = "o")]
     passed: usize,
     #[serde(rename = "i")]
     ignored: usize,
+    #[serde(rename = "p")]
+    panic: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "s")]
     suites: Vec<SuiteResult>,
@@ -190,6 +206,10 @@ struct SuiteResult {
 struct TestResult {
     #[serde(rename = "n")]
     name: Box<str>,
+    #[serde(rename = "s")]
+    strict: bool,
+    #[serde(skip)]
+    result_text: Box<str>,
     #[serde(rename = "r")]
     result: TestOutcomeResult,
 }
