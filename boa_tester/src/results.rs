@@ -164,28 +164,70 @@ pub(crate) fn compare_results(base: &Path, new: &Path, markdown: bool) {
     ))
     .expect("could not read the new results");
 
-    if base_results.results.total != new_results.results.total
-        || base_results.results.passed != new_results.results.passed
-        || base_results.results.ignored != new_results.results.ignored
-        || base_results.results.panic != new_results.results.panic
-    {
-        for (base_suite, new_suite) in base_results
-            .results
-            .suites
-            .into_iter()
-            .zip(new_results.results.suites.into_iter())
-        {
-            compare_suite(base_suite, new_suite)
-        }
-    } else if markdown {
-        println!("## Test262 conformance changes:");
-        println!("No changes found.");
-    } else {
-        println!("No Test262 conformance changes found.");
-    }
-}
+    let base_total = base_results.results.total as isize;
+    let new_total = new_results.results.total as isize;
+    let base_passed = base_results.results.passed as isize;
+    let new_passed = new_results.results.passed as isize;
+    let base_ignored = base_results.results.ignored as isize;
+    let new_ignored = new_results.results.ignored as isize;
+    let base_failed = base_total - base_passed - base_ignored;
+    let new_failed = new_total - new_passed - new_ignored;
+    let base_panics = base_results.results.panic as isize;
+    let new_panics = new_results.results.panic as isize;
 
-/// Compares two suite results.
-fn compare_suite(base: SuiteResult, new: SuiteResult) {
-    todo!()
+    if markdown {
+        println!("## Test262 conformance changes:");
+        println!("| Test result | master count | PR count | difference |");
+        println!(
+            "| :Passed: | :{}: | :{}: | :{}: |",
+            base_passed,
+            new_passed,
+            base_passed - new_passed
+        );
+        println!(
+            "| :Ignored: | :{}: | :{}: | :{}: |",
+            base_ignored,
+            new_ignored,
+            base_ignored - new_ignored
+        );
+        println!(
+            "| :Failed: | :{}: | :{}: | :{}: |",
+            base_failed,
+            new_failed,
+            base_failed - new_failed,
+        );
+        println!(
+            "| :Panics: | :{}: | :{}: | :{}: |",
+            base_panics,
+            new_panics,
+            base_panics - new_panics
+        );
+    } else {
+        println!("Test262 conformance changes:");
+        println!("| Test result | master |    PR   | difference |");
+        println!(
+            "|    Passed   | {:^6} | {:^5} | {:^10} |",
+            base_passed,
+            new_passed,
+            base_passed - new_passed
+        );
+        println!(
+            "|   Ignored   | {:^6} | {:^5} | {:^10} |",
+            base_ignored,
+            new_ignored,
+            base_ignored - new_ignored
+        );
+        println!(
+            "|   Failed    | {:^6} | {:^5} | {:^10} |",
+            base_failed,
+            new_failed,
+            base_failed - new_failed,
+        );
+        println!(
+            "|   Panics    | {:^6} | {:^5} | {:^10} |",
+            base_panics,
+            new_panics,
+            base_panics - new_panics
+        );
+    }
 }
